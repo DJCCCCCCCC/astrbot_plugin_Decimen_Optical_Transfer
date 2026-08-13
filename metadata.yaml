@@ -1,6 +1,6 @@
-name: helloworld # 插件唯一识别名，以 astrbot_plugin_ 前缀开头
-display_name: helloworld # 用于展示的名字，可以是方便人类阅读的名字（需要版本 >= v4.5.0，低版本不会报错，请放心填写）
-desc: AstrBot 插件示例。 # 插件简短描述
-version: v1.3.0 # 插件版本号。格式：v1.1.1 或者 v1.1
-author: Soulter # 作者
-repo: https://github.com/Soulter/helloworld # 插件的仓库地址
+name: astrbot_plugin_decimen_optical_transfer # 插件唯一识别名，以 astrbot_plugin_ 前缀开头
+display_name: Decimen 光学传输（URL 二维码） # 用于展示的名字，可以是方便人类阅读的名字（需要版本 >= v4.5.0，低版本不会报错，请放心填写）
+desc: 把文件/文本编码为 decimen 兼容的动态二维码光学传输流，通过 URL 转发；对方用浏览器打开看到动画二维码，再用另一台设备的 decimen 接收端相机扫描还原文件（文件走光不走网，零网络传输）。当前为阶段 0：编码引擎已实现并通过 golden 向量验证，播放器页面待部署。 # 插件简短描述
+version: v0.1.0 # 插件版本号。格式：v1.1.1 或者 v1.1
+author: decimen-optical-transfer # 作者
+repo: https://github.com/bashalarmistalt/decimen-optical-transfer # 插件的仓库地址（上游协议来源）

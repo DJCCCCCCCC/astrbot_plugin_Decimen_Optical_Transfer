@@ -1,0 +1,40 @@
+{
+  "block_len": {
+    "description": "每帧负载字节数（不含 20 字节帧头；越大吞吐越高、码图越密）",
+    "type": "string",
+    "options": ["480", "980", "1445", "1830", "2311", "2933"],
+    "default": "1445",
+    "hint": "对齐 decimen 官方档位（帧字节 500/1000/1465/1850/2331/2953）。1445 为均衡默认（V25，约 2.9 倍于旧 500）；调大更快但码更密，调小更稳。"
+  },
+  "use_repair": {
+    "description": "是否附加 repair 帧（体积换容错）",
+    "type": "bool",
+    "default": false,
+    "hint": "URL 场景字节流完整到齐，默认关闭；若对方播放暂停/相机漏帧，可开启以提升鲁棒性。"
+  },
+  "mode": {
+    "description": "输出形式",
+    "type": "string",
+    "options": ["file", "hosted", "both"],
+    "default": "file",
+    "hint": "file：回发自包含 HTML 文件（对方下载零网络打开，推荐）；hosted：回发 URL（需配置 host 且播放器已部署）；both：文件 + URL 都回。"
+  },
+  "host": {
+    "description": "托管播放器地址（hosted / both 模式，未设短链时用）",
+    "type": "string",
+    "default": "",
+    "hint": "例如 https://example.com；播放器页面部署在 {host}/r/ 下。"
+  },
+  "shorten_host": {
+    "description": "短链服务地址（可选；设置后优先于 host）",
+    "type": "string",
+    "default": "",
+    "hint": "指向已启动的 shorten_server.py，如 http://127.0.0.1:8123。设置后 URL 变为 {shorten_host}/r/<6位短ID>（不再把帧流塞进 URL）；数据暂存服务端。"
+  },
+  "max_payload_bytes": {
+    "description": "URL 模式的载荷上限（容器字节数；file 模式不受此限）",
+    "type": "int",
+    "default": 200000,
+    "hint": "hosted 模式超过上限时报错（避免微信/QQ 截断超长链接）；file 模式始终可用，仅受 QR k 上限（约 30MB）约束。"
+  }
+}

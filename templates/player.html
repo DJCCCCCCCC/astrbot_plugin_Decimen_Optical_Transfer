@@ -1,0 +1,805 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+<meta name="theme-color" content="#070a11" />
+<title>Decimen 光学传输 · 播放器</title>
+<!--
+  Decimen 光学传输 · 播放器页面模板（templates/player.html）— 阶段 1
+
+  角色（设计文档 §5）：对方「设备①」打开本页 → 把 URL 携带的喷泉帧字节流
+  渲染成动画二维码；对方「设备②」用 decimen 官方接收端相机扫描 → 还原文件。
+  本页只当"显示器"，不解码内容；文件字节全程走光信道，不经过任何网络。
+
+  渲染管线与 decimen send/main.ts 逐位一致（复用而非重复实现）：
+    makeCode   → 帧字节(20B 帧头+块) → QRCode.create([{data,mode:'byte'}],
+                 {errorCorrectionLevel:'L', version:首帧锁定, maskPattern:4})
+    makeCell   → rasterizeQr(modules.size, modules.data, MARGIN=4) → ImageData
+    sizeCanvas → 整数 module scale（canvas 内部）+ CSS 平滑拉伸（绝不 pixelated）
+    tick       → requestAnimationFrame + 刷新率自适应帧率（60Hz→30fps，
+                 120Hz+→55fps，decimen 官方策略；每帧 ≥2 刷新周期）+ lookahead 队列
+                 + stall 看门狗
+    stage 点击 → 全屏（decimen body.qr-full 语义）
+  因此对同一帧字节，本页产出的二维码矩阵与 decimen 发送端逐 bit 一致，
+  接收端零改动即可解出。
+
+  控制栏与媒体播放器 UI 的映射：
+    ⏯ 播放/暂停 → 暂停/恢复二维码渲染循环
+    进度条       → 当前帧（seq），可拖动跳帧
+    速度         → 取代"音量"：二维码流无音量概念，此处控制播放帧率
+                   （0.5×/1×/2×/4×，等效 tx fps 12/24/48/96）
+    ⛶ 全屏       → 播放区域全屏
+
+  模板变量（由 build_player.py 构建时替换；未替换时模板可独立打开调试）：
+    %STREAM_B64%     → 内联 base64url 帧流（自包含 HTML / data: URL 模式）
+    /*%QRCODE_LIB%*/ → 内联 node-qrcode UMD 构建（templates/vendor/qrcode.min.js）
+  运行时数据源优先级：location.hash（#b64 或 #b64|b64|... 多流）> 内联流。
+  样式 class 命名与 CSS 变量对齐 decimen shared/style.css。
+-->
+<style>
+* { box-sizing: border-box; }
+:root {
+  color-scheme: dark;
+  --bg: #070a11; --panel: #0e1420; --panel-strong: #121a29;
+  --line: #1d2740; --line-bright: #34466f;
+  --text: #dde6f5; --text-dim: #b9c6dd; --muted: #7c8aa8; --muted-dim: #5c6883;
+  --accent: #58c8ff; --accent-hi: #8adaff; --accent-ink: #04121c;
+  --green: #5fe0b0; --red: #ff7b72; --viewport-bg: #04070d;
+}
+html { background: var(--bg); }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font: 15px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  display: flex; flex-direction: column; align-items: center; gap: 14px;
+  padding: 20px; min-height: 100vh;
+}
+h1 { font-size: 16px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--accent); margin: 0; text-align: center; }
+h2 { font-size: 13px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); margin: 0; }
+p { margin: 0.4em 0; }
+a { color: var(--accent); }
+button { font: inherit; color: var(--accent-ink); background: var(--accent); border: 0; border-radius: 8px; padding: 10px 18px; font-size: 15px; font-weight: 700; cursor: pointer; transition: background-color 130ms ease; }
+button:hover { background: var(--accent-hi); }
+button:focus-visible { outline: 2px solid var(--text); outline-offset: 3px; }
+.secondary-button { color: var(--accent); background: transparent; border: 1px solid var(--line-bright); font-weight: 400; }
+.secondary-button:hover { background: var(--panel-strong); }
+[hidden] { display: none !important; }
+.hint { color: var(--muted); font-size: 13px; text-align: center; max-width: 640px; }
+.eyebrow { color: var(--muted); font-size: 12px; letter-spacing: 0.14em; text-transform: uppercase; margin: 0; }
+.site-header { width: min(92vw, 680px); display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.brand { display: inline-flex; align-items: center; gap: 8px; color: var(--text); text-decoration: none; font-weight: 700; font-size: 14px; }
+.brand-logo { width: 22px; height: 22px; }
+.mode-nav { display: flex; gap: 4px; align-items: center; }
+.mode-nav span, .mode-nav a { color: var(--muted); text-decoration: none; padding: 6px 10px; border-radius: 6px; font-size: 13px; }
+.mode-nav span[aria-current="page"] { color: var(--text); background: var(--panel-strong); }
+.site-footer { width: min(92vw, 680px); color: var(--muted-dim); font-size: 12px; text-align: center; }
+.player-shell { width: min(92vw, 680px); display: flex; flex-direction: column; align-items: center; gap: 14px; }
+.tool-intro { text-align: center; }
+/* ---- 播放区域（与 decimen .stage 语义一致） ---- */
+.stage {
+  position: relative; width: min(92vw, 620px); min-height: 120px;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--viewport-bg); border: 1px solid var(--line);
+  border-radius: 12px; padding: 16px; cursor: zoom-in; touch-action: manipulation;
+}
+.stage canvas { display: block; max-width: 100%; }
+/* 全屏态：播放区域铺满视口，其余隐藏（decimen body.qr-full 语义） */
+body.qr-full .site-header, body.qr-full .tool-intro, body.qr-full .player-controls,
+body.qr-full .stream-specs, body.qr-full .playlist, body.qr-full .status-line,
+body.qr-full .site-footer, body.qr-full .receiver-hint { display: none !important; }
+body.qr-full .player-shell { width: 100vw; }
+body.qr-full .stage { width: 100vw; height: 100vh; border: 0; border-radius: 0; padding: 0; cursor: zoom-out; }
+/* ---- 覆盖层：加载中 / 错误 ---- */
+.player-overlay {
+  position: absolute; inset: 0; z-index: 5;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px;
+  background: var(--viewport-bg); border-radius: inherit; text-align: center; padding: 20px;
+  color: var(--text-dim);
+}
+.player-overlay.error { color: var(--red); }
+.spinner {
+  width: 28px; height: 28px; border-radius: 50%;
+  border: 3px solid var(--line-bright); border-top-color: var(--accent);
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+/* ---- 控制栏 ---- */
+.player-controls {
+  width: 100%; display: flex; align-items: center; gap: 10px;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px;
+}
+.control-button {
+  flex: none; width: 42px; height: 38px; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  color: var(--text); background: var(--panel-strong); border: 1px solid var(--line-bright);
+  border-radius: 8px; font-size: 16px;
+}
+.control-button:hover { background: var(--line); }
+.seek { flex: 1 1 auto; min-width: 60px; accent-color: var(--accent); }
+.frame-indicator { flex: none; color: var(--muted); font-size: 12px; min-width: 100px; text-align: right; }
+.speed-control { flex: none; display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
+.speed-control select { background: var(--panel-strong); color: var(--text); border: 1px solid var(--line-bright); border-radius: 6px; padding: 4px 6px; font: inherit; font-size: 12px; }
+/* ---- 传输信息（对齐 .stream-specs） ---- */
+.stream-specs {
+  width: 100%; display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 8px; margin: 0; padding: 12px; background: var(--panel);
+  border: 1px solid var(--line); border-radius: 10px;
+}
+.stream-specs div { display: flex; flex-direction: column; gap: 2px; }
+.stream-specs dt { color: var(--muted); font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; }
+.stream-specs dd { margin: 0; color: var(--text); font-size: 13px; word-break: break-all; }
+/* ---- 播放列表 ---- */
+.playlist {
+  width: 100%; background: var(--panel); border: 1px solid var(--line);
+  border-radius: 10px; padding: 12px; display: flex; flex-direction: column; gap: 8px;
+}
+.playlist ol { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; max-height: 180px; overflow-y: auto; }
+.playlist li { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 10px; border-radius: 8px; cursor: pointer; border: 1px solid transparent; }
+.playlist li:hover { background: var(--panel-strong); }
+.playlist li.active { border-color: var(--accent); background: var(--panel-strong); }
+.playlist .track-name { color: var(--text); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.playlist .track-meta { color: var(--muted); font-size: 11px; flex: none; }
+.playlist .track-broken { color: var(--red); font-size: 11px; flex: none; }
+.status-line { width: 100%; min-height: 1.5em; text-align: center; }
+.status-line.error { color: var(--red); }
+.status-line.ok { color: var(--green); }
+.receiver-hint { color: var(--muted); font-size: 13px; text-align: center; border: 1px dashed var(--line-bright); border-radius: 10px; padding: 10px 14px; }
+</style>
+</head>
+<body class="tool-page">
+<header class="site-header">
+  <a class="brand" href="#">
+    <svg class="brand-logo" viewBox="0 0 543 554.1" fill="currentColor" aria-hidden="true"><g transform="translate(-241,789) scale(0.1,-0.1)"><path d="M2410 6513 l0 -1378 103 101 c540 531 1324 986 1984 1153 402 102 850 95 1268 -21 529 -146 1300 -581 1860 -1050 175 -146 212 -184 199 -205 -37 -63 -502 -432 -754 -600 -969 -644 -1785 -844 -2590 -634 -667 174 -1376 581 -1947 1118 l-123 115 0 -1382 0 -1381 1478 4 c1291 3 1491 5 1588 20 1345 194 2240 1124 2355 2446 17 195 7 620 -19 786 -192 1236 -1030 2069 -2262 2249 -217 32 -411 36 -1772 36 l-1368 0 0 -1377z"/><path d="M4945 5906 c-300 -68 -532 -287 -611 -577 -25 -89 -25 -289 0 -378 141 -513 724 -749 1179 -477 405 242 503 778 209 1148 -100 125 -258 229 -417 273 -82 22 -282 29 -360 11z"/></g></svg>
+    Decimen 光学传输 · 播放器
+  </a>
+  <nav class="mode-nav" aria-label="模式"><span aria-current="page">播放</span><a href="https://decimen.app/receive/" target="_blank" rel="noopener noreferrer">接收端</a></nav>
+</header>
+
+<main class="player-shell">
+  <section class="tool-intro">
+    <p class="eyebrow">Screen → camera · 光学播放</p>
+    <h1>二维码流播放器</h1>
+    <p>用另一台设备的 decimen 接收端相机扫描下方区域，即可还原文件。文件走光，不走网。</p>
+  </section>
+
+  <!-- 播放区域：动画二维码（点击可全屏） -->
+  <section class="stage" id="stage" hidden>
+    <canvas id="qr" width="16" height="16"></canvas>
+    <div class="player-overlay" id="loading" hidden>
+      <span class="spinner"></span>
+      <p id="loading-text">正在解析传输流…</p>
+    </div>
+    <div class="player-overlay error" id="error" hidden>
+      <p id="error-text"></p>
+      <button id="error-retry" class="secondary-button" type="button">重新加载</button>
+    </div>
+  </section>
+
+  <!-- 控制栏：播放/暂停 · 进度条（跳帧）· 速度（原音量位）· 全屏 -->
+  <section class="player-controls" id="controls" hidden>
+    <button id="btn-play" class="control-button" type="button" title="播放 / 暂停（空格）" aria-label="播放或暂停">⏸</button>
+    <input id="seek" class="seek" type="range" min="0" max="100" value="0" step="1" aria-label="帧进度" title="帧进度（可拖动跳帧）" />
+    <span id="frame-indicator" class="frame-indicator">0 / 0</span>
+    <label class="speed-control" title="播放帧率。1× 为当前屏幕的最优传输帧率（60Hz→30fps，120Hz+→55fps）；更高倍速仅建议高刷屏使用">
+      速度
+      <select id="speed">
+        <option value="0.5">0.5×</option>
+        <option value="1" selected>1×（最优）</option>
+        <option value="2">2×（高刷）</option>
+        <option value="4">4×（高刷）</option>
+      </select>
+    </label>
+    <button id="btn-fullscreen" class="control-button" type="button" title="全屏" aria-label="全屏">⛶</button>
+  </section>
+
+  <!-- 当前传输信息（文件名/大小/类型/参数，来自 DCF2 容器头与帧头） -->
+  <dl class="stream-specs" id="stream-specs" hidden>
+    <div><dt>当前传输</dt><dd id="spec-payload">—</dd></div>
+    <div><dt>文件大小</dt><dd id="spec-size">—</dd></div>
+    <div><dt>类型</dt><dd id="spec-type">—</dd></div>
+    <div><dt>喷泉块</dt><dd id="spec-k">—</dd></div>
+    <div><dt>帧负载</dt><dd id="spec-frame">—</dd></div>
+    <div><dt>二维码</dt><dd id="spec-qr">—</dd></div>
+    <div><dt>压缩</dt><dd id="spec-compression">—</dd></div>
+  </dl>
+
+  <!-- 播放列表：URL 中携带的多个传输流（#b64|b64|...） -->
+  <section class="playlist" id="playlist" hidden>
+    <h2>传输列表</h2>
+    <ol id="playlist-items"></ol>
+  </section>
+
+  <div class="receiver-hint" id="receiver-hint" hidden>
+    对方操作：设备①打开本页显示二维码 → 设备②打开 decimen 接收端
+    （<a href="https://decimen.app/receive/" target="_blank" rel="noopener noreferrer">decimen.app/receive</a>）扫描屏幕。
+    保持本页可见、屏幕调亮；接收端集齐全部帧后会自动校验并还原文件。
+  </div>
+
+  <div class="hint status-line" id="status">就绪</div>
+</main>
+
+<footer class="site-footer">
+  <span>Decimen 光学传输 · 播放器模板 v0.1.0 · 协议源自 <a href="https://github.com/bashalarmistalt/decimen-optical-transfer">decimen-optical-transfer</a>（AGPL-3.0-or-later）</span>
+</footer>
+
+<!-- 内联 QR 生成库（node-qrcode UMD；构建时由 build_player.py 替换，未替换则调试模式回退本地文件） -->
+<script>
+/*%QRCODE_LIB%*/
+</script>
+<script>
+"use strict";
+(function () {
+  // ---------------------------------------------------------------- 常量
+  var HEADER_LEN = 20;
+  var MARGIN = 4;          // quiet-zone 模块数（与 send/main.ts 一致）
+  var LOOKAHEAD = 8;       // 预生成帧数（大块高刷下防卡顿；decimen 单码为 3，此处加深）
+  // 帧率自适应（decimen shared/send-settings.ts 官方策略）：
+  //   60Hz 屏   → 30fps（每帧 ≥2 刷新周期，扫码稳定，比旧 24fps 快 25%）
+  //   ≥100Hz 屏 → 55fps（120Hz 屏每帧 ≥2 刷新周期，且故意错相 5fps 防撕裂）
+  // 探测完成前用 30 兜底；完成后通过 setSpeed 同步到已启动的播放器。
+  var BASE_FPS = 30;
+  var MAGIC0 = 0xd1;
+  var MAGIC1 = 0x0d;       // wire v2
+  var ECC = "L";
+  var MASK_PATTERN = 4;    // 固定掩码（与 send/main.ts 一致）
+  var INLINE_STREAM = "%STREAM_B64%"; // 构建时替换为内联帧流；未替换保持原样
+
+  // ---------------------------------------------------------------- 光栅化
+  // 与 decimen shared/qr-raster.ts 逐位一致：模块矩阵 → RGBA 像素（含 quiet zone）
+  // pixels 为小端 u32：0xffffffff = 白，0xff000000 = 不透明黑，可直接包成 ImageData
+  var QR_WHITE = 0xffffffff;
+  var QR_BLACK = 0xff000000;
+  function rasterizeQr(moduleCount, modules, margin) {
+    var size = moduleCount + 2 * margin;
+    var pixels = new Uint32Array(size * size);
+    pixels.fill(QR_WHITE);
+    for (var y = 0; y < moduleCount; y++) {
+      var row = (y + margin) * size + margin;
+      var src = y * moduleCount;
+      for (var x = 0; x < moduleCount; x++) {
+        if (modules[src + x]) pixels[row + x] = QR_BLACK;
+      }
+    }
+    return { size: size, pixels: pixels };
+  }
+
+  // ---------------------------------------------------------------- DOM
+  var stage = document.getElementById("stage");
+  var canvas = document.getElementById("qr");
+  var loading = document.getElementById("loading");
+  var errorEl = document.getElementById("error");
+  var errorText = document.getElementById("error-text");
+  var loadingText = document.getElementById("loading-text");
+  var controls = document.getElementById("controls");
+  var btnPlay = document.getElementById("btn-play");
+  var seek = document.getElementById("seek");
+  var frameIndicator = document.getElementById("frame-indicator");
+  var speedSel = document.getElementById("speed");
+  var btnFullscreen = document.getElementById("btn-fullscreen");
+  var specs = document.getElementById("stream-specs");
+  var spec = function (id) { return document.getElementById(id); };
+  var playlistSec = document.getElementById("playlist");
+  var playlistItems = document.getElementById("playlist-items");
+  var receiverHint = document.getElementById("receiver-hint");
+  var statusLine = document.getElementById("status");
+
+  function setStatus(msg, kind) {
+    statusLine.textContent = msg;
+    statusLine.className = "hint status-line" + (kind ? " " + kind : "");
+  }
+  function formatBytes(n) {
+    if (n < 1024) return n + " B";
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+    return (n / 1024 / 1024).toFixed(2) + " MB";
+  }
+
+  // ---------------------------------------------------------------- 数据源
+  /** 从 location.hash 解析流列表：'#b64' 或 '#b64|b64|...'；无 hash 时回退内联。 */
+  function collectSources() {
+    var hash = location.hash.replace(/^#/, "").trim();
+    var parts = [];
+    if (hash) parts = hash.split("|").filter(function (s) { return s; });
+    if (parts.length === 0 && INLINE_STREAM && INLINE_STREAM.indexOf("%") !== 0) {
+      parts = [INLINE_STREAM];
+    }
+    return parts;
+  }
+
+  function b64urlDecode(b64url) {
+    var b64 = b64url.replace(/-/g, "+").replace(/_/g, "/");
+    while (b64.length % 4) b64 += "=";
+    var bin = atob(b64);
+    var out = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+
+  // ---------------------------------------------------------------- 流解析
+  /** 校验帧流并拆帧。返回 {frames, header}；失败抛错。 */
+  function parseStream(stream) {
+    if (stream.length <= HEADER_LEN) throw new Error("传输流为空或过短。");
+    if (stream[0] !== MAGIC0 || stream[1] !== MAGIC1) {
+      throw new Error("帧头 magic 不匹配（0xD1 0x0D）：不是 decimen wire v2 流。");
+    }
+    var dv = new DataView(stream.buffer, stream.byteOffset, stream.byteLength);
+    var sessionId = dv.getUint16(2, true);
+    var seq0 = dv.getUint32(4, true);
+    var k = dv.getUint16(8, true);
+    var blockLen = dv.getUint16(10, true);
+    var totalLen = dv.getUint32(12, true);
+    var payloadFnv = dv.getUint32(16, true);
+    if (k === 0 || blockLen === 0 || totalLen === 0) {
+      throw new Error("帧头字段非法（k/blockLen/totalLen 为 0）。");
+    }
+    var frameLen = HEADER_LEN + blockLen;
+    if (stream.length % frameLen !== 0) {
+      throw new Error(
+        "链接数据不完整（长度 " + stream.length + " 与帧长 " + frameLen + " 不匹配）。"
+        + "请重新完整复制聊天里的链接，再打开本页。"
+      );
+    }
+    var count = stream.length / frameLen;
+    if (count !== k && count !== 2 * k) {
+      throw new Error(
+        "链接数据不完整：期望 " + k + "（systematic）或 " + 2 * k + "（+repair）帧，实际 " + count + "。"
+        + "请重新完整复制聊天里的链接，再打开本页。"
+      );
+    }
+    var frames = new Array(count);
+    for (var i = 0; i < count; i++) {
+      frames[i] = stream.subarray(i * frameLen, (i + 1) * frameLen);
+    }
+    return {
+      frames: frames,
+      header: { sessionId: sessionId, seq0: seq0, k: k, blockLen: blockLen, totalLen: totalLen, payloadFnv: payloadFnv },
+    };
+  }
+
+  /** 从第 0 帧的块解析 DCF2 容器头（尽力而为，失败返回 null）。 */
+  function parseContainerInfo(firstFrame) {
+    try {
+      var block = firstFrame.subarray(HEADER_LEN);
+      if (block.length < 17) return null;
+      if (String.fromCharCode(block[0], block[1], block[2], block[3]) !== "DCF2") return null;
+      var dv = new DataView(block.buffer, block.byteOffset, block.byteLength);
+      var gzipFlag = block[4];
+      var nameLen = dv.getUint16(5, true);
+      var typeLen = dv.getUint16(7, true);
+      var origLen = dv.getUint32(9, true);
+      var transLen = dv.getUint32(13, true);
+      var name = "", type = "";
+      var dec = new TextDecoder();
+      try {
+        name = dec.decode(block.subarray(49, 49 + Math.min(nameLen, block.length - 49)));
+        type = dec.decode(block.subarray(49 + nameLen, 49 + nameLen + Math.min(typeLen, Math.max(0, block.length - 49 - nameLen))));
+      } catch (e) { /* 忽略解码错误 */ }
+      return { name: name, type: type, origLen: origLen, transLen: transLen, gzip: gzipFlag === 1 };
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // ---------------------------------------------------------------- 播放器
+  /** 创建单个流的播放器实例。渲染管线与 send/main.ts 一致。 */
+  function createPlayer(sourceB64, onMeta) {
+    var stream = b64urlDecode(sourceB64);
+    var parsed = parseStream(stream);
+    var frames = parsed.frames;
+    var header = parsed.header;
+    var k = header.k;
+    var blockLen = header.blockLen;
+    var meta = parseContainerInfo(frames[0]);
+    if (onMeta) onMeta(meta);
+
+    var seqOf = function (frameIndex) {
+      var dv = new DataView(frames[frameIndex].buffer, frames[frameIndex].byteOffset, frames[frameIndex].byteLength);
+      return dv.getUint32(4, true);
+    };
+
+    var disposed = false;
+    var playing = true;
+    var version = undefined;
+    var modules = 0;
+    var scale = 1;
+    var staging = document.createElement("canvas");
+    var queue = [];
+    var nextFrameIndex = 0;  // 预生成游标
+    var curFrameIndex = 0;   // 当前渲染帧
+    var rafId = 0;
+    var nextAt = 0;
+    var lastTickAt = 0;
+    var intervalMs = 1000 / BASE_FPS;
+    var generatorFailed = false;
+    var lastGenError = "";   // 最近一次帧生成的原始异常（用于诊断）
+    var pendingImage = null; // 当前帧的 ImageData（resize 时重绘）
+
+    // ---- 与 send/main.ts makeCode/makeCell 逐位一致 ----
+    function makeCode(frameIndex) {
+      return QRCode.create([{ data: frames[frameIndex], mode: "byte" }], {
+        errorCorrectionLevel: ECC,
+        version: version,
+        maskPattern: MASK_PATTERN,
+      });
+    }
+    function makeCell(frameIndex) {
+      var qr = makeCode(frameIndex);
+      if (version === undefined) {
+        version = qr.version;
+        modules = qr.modules.size;
+        spec("spec-qr").textContent = "V" + version + " · ECC " + ECC;
+        spec("spec-frame").textContent = blockLen + " B";
+        spec("spec-k").textContent = "K = " + k;
+        spec("spec-compression").textContent = meta && meta.gzip ? "gzip" : "none";
+        sizeCanvas();
+      }
+      var raster = rasterizeQr(qr.modules.size, qr.modules.data, MARGIN);
+      return new ImageData(new Uint8ClampedArray(raster.pixels.buffer), raster.size, raster.size);
+    }
+
+    // ---- 画布尺寸（与 send/main.ts sizeCanvas 一致：整数 scale + CSS 平滑）----
+    function sizeCanvas() {
+      if (modules === 0) return;
+      var dpr = window.devicePixelRatio || 1;
+      var cell = modules + 2 * MARGIN;
+      var totalW = cell;
+      var totalH = cell;
+      var budgetW, budgetH;
+      if (document.body.classList.contains("qr-full")) {
+        budgetW = window.innerWidth;
+        budgetH = window.innerHeight;
+      } else {
+        var containerWidth = stage.parentElement ? stage.parentElement.getBoundingClientRect().width : window.innerWidth;
+        budgetW = budgetH = Math.max(1, Math.min(0.9 * Math.min(window.innerWidth, window.innerHeight), containerWidth, 620));
+      }
+      scale = Math.max(1, Math.floor(Math.min((budgetW * dpr) / totalW, (budgetH * dpr) / totalH)));
+      staging.width = totalW;
+      staging.height = totalH;
+      canvas.width = totalW * scale;
+      canvas.height = totalH * scale;
+      var cssNativeW = (totalW * scale) / dpr;
+      var cssNativeH = (totalH * scale) / dpr;
+      var stretch = Math.max(1, Math.min(budgetW / cssNativeW, budgetH / cssNativeH));
+      canvas.style.width = cssNativeW * stretch + "px";
+      canvas.style.height = cssNativeH * stretch + "px";
+      canvas.style.imageRendering = "auto";
+      repaintCurrent();
+    }
+
+    function repaintCurrent() {
+      if (modules === 0 || pendingImage === null) return;
+      var ctx = canvas.getContext("2d");
+      ctx.imageSmoothingEnabled = false;
+      var sctx = staging.getContext("2d");
+      sctx.clearRect(0, 0, staging.width, staging.height);
+      sctx.putImageData(pendingImage, 0, 0);
+      ctx.drawImage(staging, 0, 0, pendingImage.width, pendingImage.height, 0, 0, pendingImage.width * scale, pendingImage.height * scale);
+    }
+
+    function pump(max) {
+      if (generatorFailed || disposed) return;
+      try {
+        for (var n = 0; n < max && queue.length < LOOKAHEAD; n++) {
+          queue.push(makeCell(nextFrameIndex));
+          nextFrameIndex = (nextFrameIndex + 1) % frames.length;
+        }
+      } catch (err) {
+        generatorFailed = true;
+        lastGenError = err instanceof Error ? err.message : String(err);
+        showError(lastGenError);
+      }
+    }
+
+    function paintFrame(frameIndex) {
+      var img = queue.length ? queue.shift() : makeCell(frameIndex);
+      pump(1);
+      pendingImage = img;
+      var ctx = canvas.getContext("2d");
+      ctx.imageSmoothingEnabled = false;
+      var sctx = staging.getContext("2d");
+      sctx.clearRect(0, 0, staging.width, staging.height);
+      sctx.putImageData(img, 0, 0);
+      ctx.drawImage(staging, 0, 0, img.width, img.height, 0, 0, img.width * scale, img.height * scale);
+      curFrameIndex = frameIndex;
+      updateProgress(frameIndex);
+    }
+
+    function updateProgress(frameIndex) {
+      var seq = seqOf(frameIndex);
+      seek.max = String(frames.length - 1);
+      seek.value = String(frameIndex);
+      frameIndicator.textContent = "帧 " + seq + " · " + (frameIndex + 1) + "/" + frames.length;
+    }
+
+    // ---- 循环（与 send/main.ts tick 一致：rAF + interval 节流 + stall 看门狗）----
+    function tick(now) {
+      if (disposed || generatorFailed) return;
+      rafId = requestAnimationFrame(tick);
+      var since = now - lastTickAt;
+      lastTickAt = now;
+      if (since > 1000) {
+        setStatus("画面冻结 " + (since / 1000).toFixed(1) + " s —— 本窗口曾被隐藏或置于后台，接收端可能失去锁定。请保持页面可见。");
+      }
+      if (now < nextAt) return;
+      if (now - nextAt > intervalMs) nextAt = now;
+      while (now >= nextAt) {
+        paintFrame((curFrameIndex + 1) % frames.length);
+        nextAt += intervalMs;
+      }
+    }
+
+    function startLoop() {
+      disposed = false;
+      generatorFailed = false;
+      queue.length = 0;
+      nextFrameIndex = 0;
+      curFrameIndex = 0;
+      stage.hidden = false;
+      nextAt = performance.now();
+      lastTickAt = performance.now();
+      pump(LOOKAHEAD);
+      if (generatorFailed || queue.length === 0) {
+        showError(
+          "无法生成二维码帧："
+            + (lastGenError || "数据可能损坏或超出 QR 容量。")
+        );
+        return false;
+      }
+      paintFrame(0);
+      rafId = requestAnimationFrame(tick);
+      return true;
+    }
+
+    function pause() {
+      if (!playing || disposed) return;
+      playing = false;
+      cancelAnimationFrame(rafId);
+      btnPlay.textContent = "▶";
+      setStatus("已暂停 —— 接收端将停止收集帧，恢复播放后继续。", "ok");
+    }
+    function resume() {
+      if (playing || disposed) return;
+      playing = true;
+      nextAt = performance.now();
+      lastTickAt = performance.now();
+      rafId = requestAnimationFrame(tick);
+      btnPlay.textContent = "⏸";
+      setStatus("播放中 —— 保持页面可见，接收端扫描即可还原文件。", "ok");
+    }
+    function seekTo(frameIndex) {
+      frameIndex = Math.max(0, Math.min(frames.length - 1, frameIndex));
+      nextFrameIndex = frameIndex;
+      queue.length = 0;
+      paintFrame(frameIndex);
+    }
+    function setSpeed(mult) {
+      intervalMs = 1000 / (BASE_FPS * (mult || 1));
+      nextAt = performance.now();
+    }
+    function dispose() {
+      disposed = true;
+      cancelAnimationFrame(rafId);
+    }
+
+    return {
+      start: startLoop,
+      pause: pause,
+      resume: resume,
+      seekTo: seekTo,
+      setSpeed: setSpeed,
+      dispose: dispose,
+      isPlaying: function () { return playing; },
+      reflow: sizeCanvas,
+      frameCount: frames.length,
+      k: k,
+      meta: meta,
+    };
+  }
+
+  // ---------------------------------------------------------------- 列表与状态
+  var tracks = [];
+  var currentTrack = -1;
+
+  function renderPlaylist() {
+    playlistItems.textContent = "";
+    tracks.forEach(function (t, i) {
+      var li = document.createElement("li");
+      li.className = i === currentTrack ? "active" : "";
+      var name = document.createElement("span");
+      name.className = "track-name";
+      name.textContent = t.name || ("流 " + (i + 1));
+      name.title = t.name || "";
+      var meta = document.createElement("span");
+      if (t.broken) {
+        meta.className = "track-broken";
+        meta.textContent = "解析失败";
+      } else {
+        meta.className = "track-meta";
+        meta.textContent = formatBytes(t.size) + " · " + t.k + " 帧";
+      }
+      li.appendChild(name);
+      li.appendChild(meta);
+      li.addEventListener("click", function () { void switchTrack(i); });
+      playlistItems.appendChild(li);
+    });
+    playlistSec.hidden = tracks.length === 0;
+  }
+
+  function showError(msg) {
+    stage.hidden = false;
+    loading.hidden = true;
+    errorEl.hidden = false;
+    errorText.textContent = msg;
+    setStatus("出错：" + msg, "error");
+  }
+  function showLoading(msg) {
+    stage.hidden = false;
+    errorEl.hidden = true;
+    loading.hidden = false;
+    loadingText.textContent = msg || "正在解析传输流…";
+  }
+  function showReady(track) {
+    loading.hidden = true;
+    errorEl.hidden = true;
+    controls.hidden = false;
+    specs.hidden = false;
+    receiverHint.hidden = false;
+    spec("spec-payload").textContent = track.name || "未知文件";
+    spec("spec-size").textContent = formatBytes(track.size);
+    spec("spec-type").textContent = track.type || "application/octet-stream";
+    setStatus("播放中 —— 保持页面可见，接收端扫描即可还原文件。", "ok");
+  }
+
+  function disposeCurrent() {
+    if (currentTrack >= 0 && tracks[currentTrack] && tracks[currentTrack].player) {
+      tracks[currentTrack].player.dispose();
+    }
+    currentTrack = -1;
+  }
+
+  function switchTrack(index) {
+    if (index === currentTrack) return;
+    disposeCurrent();
+    var t = tracks[index];
+    currentTrack = index;
+    showLoading("正在解析传输流 " + (index + 1) + "/" + tracks.length + " …");
+    var player = createPlayer(t.sourceB64, function (meta) {
+      t.name = meta && meta.name ? meta.name : t.name;
+      t.type = meta && meta.type ? meta.type : t.type;
+      t.size = meta && meta.origLen ? meta.origLen : t.size;
+    });
+    t.player = player;
+    setTimeout(function () {
+      if (player.start()) {
+        showReady(t);
+        renderPlaylist();
+      }
+    }, 30);
+  }
+
+  function boot() {
+    var sources = collectSources();
+    if (sources.length === 0) {
+      showError("未找到传输流：请从聊天中的链接打开本页（URL 带 # 数据），或使用构建后的自包含 HTML。");
+      return;
+    }
+    tracks = sources.map(function (b64, i) {
+      try {
+        var stream = b64urlDecode(b64);
+        var parsed = parseStream(stream);
+        var info = parseContainerInfo(parsed.frames[0]);
+        return {
+          name: info && info.name ? info.name : "流 " + (i + 1),
+          size: info ? info.origLen : 0,
+          type: info ? info.type : "",
+          k: parsed.header.k,
+          sourceB64: b64,
+          broken: false,
+        };
+      } catch (e) {
+        return { name: "流 " + (i + 1) + "（解析失败）", size: 0, type: "", k: 0, sourceB64: b64, broken: true };
+      }
+    });
+    var first = -1;
+    for (var i = 0; i < tracks.length; i++) {
+      if (!tracks[i].broken) { first = i; break; }
+    }
+    renderPlaylist();
+    if (first < 0) {
+      showError("所有传输流都无法解析。请检查链接数据是否完整。");
+      return;
+    }
+    void switchTrack(first);
+  }
+
+  // ---------------------------------------------------------------- 事件
+  btnPlay.addEventListener("click", function () {
+    var t = tracks[currentTrack];
+    if (!t || !t.player) return;
+    if (t.player.isPlaying()) t.player.pause(); else t.player.resume();
+  });
+  seek.addEventListener("input", function () {
+    var t = tracks[currentTrack];
+    if (!t || !t.player) return;
+    t.player.seekTo(Number(seek.value));
+  });
+  speedSel.addEventListener("change", function () {
+    var t = tracks[currentTrack];
+    if (t && t.player) t.player.setSpeed(Number(speedSel.value));
+    setStatus("播放速度 " + speedSel.value + "×（等效 tx fps " + (BASE_FPS * Number(speedSel.value)) + "）", "ok");
+  });
+  btnFullscreen.addEventListener("click", function () { toggleFullscreen(); });
+  stage.addEventListener("click", function (event) {
+    if (event.target.closest && event.target.closest(".player-overlay")) return;
+    toggleFullscreen();
+  });
+  window.addEventListener("keydown", function (event) {
+    if (event.key === "Escape" && document.body.classList.contains("qr-full")) toggleFullscreen();
+    if (event.code === "Space" && !event.repeat) {
+      var t = tracks[currentTrack];
+      if (t && t.player) {
+        event.preventDefault();
+        if (t.player.isPlaying()) t.player.pause(); else t.player.resume();
+      }
+    }
+  });
+  window.addEventListener("resize", function () {
+    var t = tracks[currentTrack];
+    if (t && t.player) t.player.reflow();
+  });
+  document.getElementById("error-retry").addEventListener("click", function () {
+    window.location.reload();
+  });
+
+  function toggleFullscreen() {
+    var on = document.body.classList.toggle("qr-full");
+    var t = tracks[currentTrack];
+    if (t && t.player) t.player.reflow();
+    window.scrollTo(0, 0);
+    if (on) {
+      try {
+        if (stage.requestFullscreen) stage.requestFullscreen().catch(function () {});
+      } catch (e) { /* 忽略 */ }
+    } else if (document.fullscreenElement) {
+      document.exitFullscreen().catch(function () {});
+    }
+  }
+
+  // ---------------------------------------------------------------- 刷新率探测
+  // 用 rAF 间隔估计屏幕刷新率，选择 decimen 官方最优帧率：
+  //   60Hz 屏   → 30fps（每帧 ≥2 刷新周期，扫码稳定）
+  //   ≥100Hz 屏 → 55fps（每帧 ≥2 刷新周期 + 错相防撕裂）
+  // 探测约需 20 个 rAF（60Hz 下 ~330ms），期间播放器按 30fps 兜底运行，
+  // 完成后同步到所有已启动的播放器实例。
+  var hzSamples = 0;
+  var hzStartAt = performance.now();
+  function probeRefreshRate(now) {
+    hzSamples++;
+    if (hzSamples < 20) {
+      requestAnimationFrame(probeRefreshRate);
+      return;
+    }
+    var avgMs = (now - hzStartAt) / hzSamples;
+    var hz = Math.round(1000 / avgMs);
+    var newFps = hz >= 100 ? 55 : 30;
+    if (newFps !== BASE_FPS) {
+      BASE_FPS = newFps;
+      // 同步到已启动的播放器（保持用户当前倍速）
+      var mult = Number(speedSel.value) || 1;
+      tracks.forEach(function (t) {
+        if (t.player) t.player.setSpeed(mult);
+      });
+      setStatus(
+        "屏幕 " + hz + "Hz → 传输 " + BASE_FPS + "fps" +
+        (mult !== 1 ? "（×" + mult + " = " + Math.round(BASE_FPS * mult) + "fps）" : "") +
+        "。保持页面可见，接收端扫描即可还原文件。",
+        "ok"
+      );
+    }
+  }
+  requestAnimationFrame(probeRefreshRate);
+
+  boot();
+})();
+</script>
+</body>
+</html>
