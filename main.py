@@ -15,6 +15,7 @@ base64url 包进 URL 回发到聊天。对方用浏览器打开 URL 看到动画
 from __future__ import annotations
 
 import base64
+import logging
 import mimetypes
 import os
 import re
@@ -37,6 +38,49 @@ from astrbot.api.star import Context, Star, StarTools
 _HTTP_PREFIXES = ("http://", "https://")
 _BASE64_PREFIX = "base64://"
 _FILE_PREFIX = "file://"
+
+_QQ_NOISE_FILTER_INSTALLED = False
+
+
+def _install_qq_noise_filter() -> None:
+    """静默 AstrBot 内核里关于 QQ 图床下载失败的日志。
+
+    背景：gchat.qpic.cn 的下载 URL 依赖 NapCat Rkey 签名服务；该社区服务失效时，
+    URL 全部返回 400 "download url has expired"。本插件已通过 NTQQ 本地缓存
+    （Pic/<YYYY-MM>/Ori/<md5>.jpg）完全绕开下载，但 AstrBot 内核的图片预处理
+    （preprocess_stage → utils.io）仍会尝试下载这些过期 URL 并打印两条报错日志。
+    这些报错与插件功能无关（缓存方案已兜底），此处用 logging 过滤器静默之——
+    仅匹配 QQ 图床下载失败的特征消息，不影响其他任何日志。
+
+    只修改本插件文件；不改动 AstrBot 内核代码。
+    """
+
+    global _QQ_NOISE_FILTER_INSTALLED
+    if _QQ_NOISE_FILTER_INSTALLED:
+        return
+    _QQ_NOISE_FILTER_INSTALLED = True
+
+    class _QpicNoiseFilter(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            try:
+                msg = record.getMessage()
+            except Exception:  # noqa: BLE001 - 防御性：消息格式化异常不拦截
+                return True
+            if "gchat.qpic.cn" in msg and (
+                "Failed to download file" in msg or "Image processing failed" in msg
+            ):
+                return False  # 静默这条已知无害的报错
+            return True
+
+    # AstrBot 内核的 utils.io 与 preprocess_stage 共用 logger "astrbot"。
+    _filter = _QpicNoiseFilter()
+    for name in ("astrbot", "astrbot.core.utils.io", "astrbot.core.pipeline.preprocess_stage.stage"):
+        lg = logging.getLogger(name)
+        if _filter not in lg.filters:
+            lg.addFilter(_filter)
+
+
+_install_qq_noise_filter()
 
 
 class DecimenOpticalTransfer(Star):
@@ -233,19 +277,102 @@ class DecimenOpticalTransfer(Star):
         chain = event.message if hasattr(event, "message") else event.get_messages()
         for comp in chain:
             if isinstance(comp, Comp.File):
-                return await self._fetch_bytes(comp), (comp.name or "transfer.bin")
+                return await self._fetch_bytes(comp, event), (comp.name or "transfer.bin")
             if isinstance(comp, Comp.Image):
                 name = getattr(comp, "name", "") or "image.png"
-                return await self._fetch_bytes(comp), name
+                return await self._fetch_bytes(comp, event), name
         raise ValueError("未找到文本或附件。用法：/qr <文本>，或回复文件并 @机器人 qr")
 
-    async def _fetch_bytes(self, comp) -> bytes:
+    async def _fetch_bytes(self, comp, event: AstrMessageEvent | None = None) -> bytes:
+        # ① QQ 平台（aiocqhttp）优先：OneBot get_image 拿本地缓存，绕开
+        #    gchat.qpic.cn 过期下载 URL（HTTP 400 "download url has expired"）。
+        #    注意：AiocqhttpMessageEvent 的 bot（CQHttp 实例）挂在事件对象本身，
+        #    不在 message_obj 上（那只是消息内容）。两种位置都兼容探测。
+        bot = getattr(event, "bot", None) or getattr(getattr(event, "message_obj", None), "bot", None)
+        if bot is not None and isinstance(comp, Comp.Image):
+            file_id = getattr(comp, "file", "") or ""
+            if file_id and not file_id.startswith(("http://", "https://", "base64://", "file://")):
+                # ①-a 先查 QQ 本地图片缓存（NTQQ 数据目录 Pic/YYYY-MM/Ori/<md5>.jpg），
+                #     完全不依赖 Rkey 签名服务（gchat.qpic.cn URL 需要 Rkey，服务挂时
+                #     URL 全部 400 "download url has expired"）。
+                md5 = re.sub(r"[^0-9a-fA-F]", "", file_id)
+                if len(md5) == 32:
+                    for ts_dir in Path.home().glob("Documents/Tencent Files/*/nt_qq/nt_data/Pic/*/Ori"):
+                        probe = ts_dir / f"{md5.lower()}.jpg"
+                        if probe.is_file():
+                            return probe.read_bytes()
+                        probe = ts_dir / f"{md5.lower()}.png"
+                        if probe.is_file():
+                            return probe.read_bytes()
+                fresh_url = ""
+                try:
+                    ret = await bot.call_action("get_image", file=file_id)
+                    ret = ret or {}
+                    fresh_url = ret.get("url", "") or ""
+                    local = ret.get("file", "") or ""
+                    # NapCat 返回的 file 可能是绝对路径，也可能是相对其数据目录的
+                    # 路径（如 napcat/xxx.jpg）。跨目录时绝对路径直接读，相对路径
+                    # 依次尝试常见 NapCat 数据目录拼接。
+                    candidates: list[str] = []
+                    if local:
+                        candidates.append(local)
+                        if local.startswith("file://"):
+                            candidates.append(local[len("file://") :])
+                    for cand in candidates:
+                        p = Path(cand)
+                        if p.is_absolute() and p.is_file():
+                            return p.read_bytes()
+                    if local and not local.startswith(("http://", "https://")):
+                        for napcat_root in (
+                            Path.home() / "NapCat.OpenClaw",
+                            Path.home() / "napcat",
+                            Path.home() / ".config" / "napcat",
+                        ):
+                            for rel in (local, local.lstrip("/\\")):
+                                probe = napcat_root / "data" / rel
+                                if probe.is_file():
+                                    return probe.read_bytes()
+                    logger.warning(f"get_image 未返回可读本地路径，尝试新鲜 URL: {local!r}")
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"OneBot get_image 失败，回退 URL 下载: {e}")
+                if fresh_url and fresh_url.startswith(_HTTP_PREFIXES):
+                    async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+                        headers = (
+                            {
+                                "User-Agent": (
+                                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                    "Chrome/126.0.0.0 Safari/537.36"
+                                ),
+                                "Referer": "https://qpic.cn/",
+                            }
+                            if "qpic.cn" in fresh_url
+                            else None
+                        )
+                        resp = await client.get(fresh_url, headers=headers)
+                        resp.raise_for_status()
+                        return resp.content
+
+        # ② 通用路径：URL / base64 / 本地文件
         url = getattr(comp, "url", "") or ""
         file = getattr(comp, "file", "") or ""
         for field in (url, file):
             if field.startswith(_HTTP_PREFIXES):
-                async with httpx.AsyncClient(timeout=60) as client:
-                    resp = await client.get(field)
+                async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+                    # QQ 图床（gchat.qpic.cn / qpic.cn）可能要求浏览器 UA，其余 URL 保持原样。
+                    headers = (
+                        {
+                            "User-Agent": (
+                                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                "Chrome/126.0.0.0 Safari/537.36"
+                            ),
+                            "Referer": "https://qpic.cn/",
+                        }
+                        if "qpic.cn" in field
+                        else None
+                    )
+                    resp = await client.get(field, headers=headers)
                     resp.raise_for_status()
                     return resp.content
             if field.startswith(_BASE64_PREFIX):
